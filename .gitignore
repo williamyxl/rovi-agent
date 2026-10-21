@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+llm/ENDPOINT.txt
+llm/STOP
+llm/logs/*.out
+runs/*/
+!runs/pbs/
+exp_results/

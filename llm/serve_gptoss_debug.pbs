@@ -1,0 +1,142 @@
+#!/bin/bash -l
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -q debug
+#PBS -A MatSciAI
+#PBS -l filesystems=flare
+#PBS -N gptoss-api
+#PBS -j oe
+#PBS -o /lus/flare/projects/MatSciAI/xiaoliyan/workdir/rovi-battery-data-ai/llm/logs/serve.out
+
+# gpt-oss-120b on one Aurora node. Layout copied from the Aurora LLM recipe:
+# 3 x vLLM TP=4 on tiles 0-3 / 4-7 / 8-11, one load balancer.
+# Queue and walltime are debug and 01:00:00. No CUDA.
+
+set -o pipefail
+ROOT=/lus/flare/projects/MatSciAI/xiaoliyan/workdir/rovi-battery-data-ai
+# shellcheck source=../src/harness/pbs_guard.sh
+source "$ROOT/src/harness/pbs_guard.sh"
+
+WORKDIR=$ROOT/llm
+MODEL=${MODEL:-/lus/flare/projects/MatSciAI/xiaoliyan/workdir/alcf-aurora-llm/gpt-oss-120b/models/openai-gpt-oss-120b}
+
+NREP=${NREP:-3}
+TPE=${TPE:-4}
+MML=${MML:-131072}
+MNS=${MNS:-128}
+MEMUTIL=${MEMUTIL:-0.85}
+KVGIB=${KVGIB:-40}
+LB_PORT=${LB_PORT:-8000}
+BASE_PORT=${BASE_PORT:-8001}
+SERVED_NAME=${SERVED_NAME:-gpt-oss-120b}
+
+mkdir -p "$WORKDIR/logs"
+
+module use /opt/aurora/26.26.0/frameworks/modulefiles
+module load frameworks
+FWPY=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/python
+VLLM=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/bin/vllm
+export HF_HUB_OFFLINE=1 TMPDIR=/tmp VLLM_XPU_FUSED_MOE_USE_REF=1
+export TIKTOKEN_RS_CACHE_DIR=${TIKTOKEN_RS_CACHE_DIR:-/lus/flare/projects/MatSciAI/xiaoliyan/workdir/alcf-aurora-llm/gpt-oss-120b/.tiktoken_cache}
+if [[ ! -d "$TIKTOKEN_RS_CACHE_DIR" ]]; then
+  echo "ERROR: tiktoken cache not found at $TIKTOKEN_RS_CACHE_DIR"
+  exit 2
+fi
+
+if [[ -f "$WORKDIR/STOP" ]]; then
+  echo "$(date -Is) STOP file present; exiting"
+  exit 0
+fi
+
+"$FWPY" - <<'PY'
+import sys
+import torch
+xpu = getattr(torch, "xpu", None)
+ok = bool(xpu is not None and xpu.is_available())
+print("xpu", ok)
+if not ok:
+    sys.stderr.write("ERROR: Intel XPU is not available\n")
+    sys.exit(3)
+PY
+
+NODE_IP=$(hostname -i | awk '{print $1}')
+NODE=$(hostname)
+echo "$(date -Is) host=$NODE ip=$NODE_IP job=$PBS_JOBID"
+echo "NREP=$NREP TPE=$TPE MML=$MML MNS=$MNS KVGIB=$KVGIB LB_PORT=$LB_PORT"
+[[ -e "$MODEL/config.json" ]] || { echo "ERROR: model not found at $MODEL"; exit 2; }
+
+pids=()
+backends=()
+for r in $(seq 0 $((NREP - 1))); do
+  lo=$((r * TPE))
+  mask=""
+  for t in $(seq 0 $((TPE - 1))); do
+    mask="$mask,$((lo + t))"
+  done
+  mask=${mask#,}
+  port=$((BASE_PORT + r))
+  backends+=("http://127.0.0.1:$port")
+  JT=${PBS_JOBID}_r${r}
+  (
+    export ZE_AFFINITY_MASK=$mask
+    export TRITON_CACHE_DIR=/tmp/tc_${JT} SYCL_CACHE_DIR=/tmp/sc_${JT}
+    mkdir -p "$TRITON_CACHE_DIR" "$SYCL_CACHE_DIR"
+    echo "[engine $r] tiles=$mask port=$port"
+    KVBYTES=$((KVGIB * 1073741824))
+    "$VLLM" serve "$MODEL" \
+      --tensor-parallel-size "$TPE" \
+      --max-model-len "$MML" --max-num-seqs "$MNS" \
+      --gpu-memory-utilization "$MEMUTIL" --kv-cache-memory-bytes "$KVBYTES" \
+      --enforce-eager --served-model-name "$SERVED_NAME" \
+      --enable-auto-tool-choice --tool-call-parser openai \
+      --host 127.0.0.1 --port "$port" \
+      > "$WORKDIR/logs/engine_r${r}.out" 2>&1
+  ) &
+  pids+=($!)
+  sleep 15
+done
+
+echo "waiting for engines..."
+for b in "${backends[@]}"; do
+  for _ in $(seq 1 90); do
+    curl -sf "$b/health" >/dev/null 2>&1 && { echo "  ready: $b"; break; }
+    sleep 10
+  done
+done
+
+"$FWPY" "$WORKDIR/lb.py" --host 0.0.0.0 --port "$LB_PORT" \
+  --backends "${backends[@]}" > "$WORKDIR/logs/lb.out" 2>&1 &
+LB_PID=$!
+sleep 3
+
+cat > "$WORKDIR/ENDPOINT.txt" <<EOF
+node=$NODE
+ip=$NODE_IP
+lb_url=http://$NODE_IP:$LB_PORT/v1
+model=$SERVED_NAME
+job=$PBS_JOBID
+started=$(date -Is)
+nrep=$NREP
+tpe=$TPE
+mml=$MML
+mns=$MNS
+EOF
+echo "ENDPOINT: http://$NODE_IP:$LB_PORT/v1"
+cat "$WORKDIR/ENDPOINT.txt"
+
+while :; do
+  sleep 60
+  [[ -f "$WORKDIR/STOP" ]] && { echo "$(date -Is) STOP file; shutting down"; break; }
+  live=0
+  for p in "${pids[@]}"; do
+    kill -0 "$p" 2>/dev/null && live=$((live + 1))
+  done
+  [[ "$live" -eq 0 ]] && { echo "$(date -Is) all engines exited"; break; }
+done
+
+kill "$LB_PID" 2>/dev/null || true
+for p in "${pids[@]}"; do
+  kill "$p" 2>/dev/null || true
+done
+echo "$(date -Is) serve job $PBS_JOBID exiting"

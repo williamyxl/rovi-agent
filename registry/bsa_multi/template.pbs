@@ -1,0 +1,15 @@
+#!/bin/bash -l
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -q debug-scaling
+#PBS -A MatSciAI
+#PBS -l filesystems=flare
+#PBS -N bsa-multi
+#PBS -j oe
+#PBS -o /lus/flare/projects/MatSciAI/xiaoliyan/workdir/rovi-battery-data-ai/runs/pbs/bsa_multi.out
+
+set -o pipefail
+ROOT=/lus/flare/projects/MatSciAI/xiaoliyan/workdir/rovi-battery-data-ai
+source "$ROOT/src/harness/pbs_guard.sh"
+exec /usr/bin/python3.11 "$ROOT/src/harness/worker_entry.py" --software bsa_multi
