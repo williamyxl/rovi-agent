@@ -1,3 +1,4 @@
+.cursor/rules/no-cursor-git-credit.mdc
 __pycache__/
 *.pyc
 llm/ENDPOINT.txt
